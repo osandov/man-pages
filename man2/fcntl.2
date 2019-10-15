@@ -217,6 +217,7 @@ in
 .I arg
 are ignored.
 On Linux, this command can change only the
+.BR O_ALLOW_ENCODED ,
 .BR O_APPEND ,
 .BR O_ASYNC ,
 .BR O_DIRECT ,
@@ -1813,6 +1814,13 @@ is
 .BR F_SETPIPE_SZ
 and the soft or hard user pipe limit has been reached; see
 .BR pipe (7).
+.TP
+.B EPERM
+Attempted to set the
+.B O_ALLOW_ENCODED
+flag and the calling process did not have the
+.B CAP_SYS_ADMIN
+capability.
 .TP
 .B EPERM
 Attempted to clear the

@@ -180,6 +180,14 @@ for details.
 .PP
 The full list of file creation flags and file status flags is as follows:
 .TP
+.B O_ALLOW_ENCODED
+Open the file with encoded I/O permissions;
+see
+.BR encoded_io (7).
+The caller must have the
+.B CAP_SYS_ADMIN
+capability.
+.TP
 .B O_APPEND
 The file is opened in append mode.
 Before each
@@ -1231,6 +1239,11 @@ did not match the owner of the file and the caller was not privileged.
 .B EPERM
 The operation was prevented by a file seal; see
 .BR fcntl (2).
+.TP
+.B EPERM
+The
+.B O_ALLOW_ENCODED
+flag was specified, but the caller was not privileged.
 .TP
 .B EROFS
 .I pathname

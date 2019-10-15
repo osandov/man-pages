@@ -1,0 +1,369 @@
+.\" Copyright (c) 2020 by Omar Sandoval <osandov@fb.com>
+.\"
+.\" %%%LICENSE_START(VERBATIM)
+.\" Permission is granted to make and distribute verbatim copies of this
+.\" manual provided the copyright notice and this permission notice are
+.\" preserved on all copies.
+.\"
+.\" Permission is granted to copy and distribute modified versions of this
+.\" manual under the conditions for verbatim copying, provided that the
+.\" entire resulting derived work is distributed under the terms of a
+.\" permission notice identical to this one.
+.\"
+.\" Since the Linux kernel and libraries are constantly changing, this
+.\" manual page may be incorrect or out-of-date.  The author(s) assume no
+.\" responsibility for errors or omissions, or for damages resulting from
+.\" the use of the information contained herein.  The author(s) may not
+.\" have taken the same level of care in the production of this manual,
+.\" which is licensed free of charge, as they might when working
+.\" professionally.
+.\"
+.\" Formatted or processed versions of this manual, if unaccompanied by
+.\" the source, must acknowledge the copyright and authors of this work.
+.\" %%%LICENSE_END
+.\"
+.\"
+.TH ENCODED_IO  7 2020-11-11 "Linux" "Linux Programmer's Manual"
+.SH NAME
+encoded_io \- overview of encoded I/O
+.SH DESCRIPTION
+Several filesystems (e.g., Btrfs) support transparent encoding
+(e.g., compression, encryption) of data on disk:
+written data is encoded by the kernel before it is written to disk,
+and read data is decoded before being returned to the user.
+In some cases, it is useful to skip this encoding step.
+For example, the user may want to read the compressed contents of a file
+or write pre-compressed data directly to a file.
+This is referred to as "encoded I/O".
+.SS Encoded I/O API
+Encoded I/O is specified with the
+.B RWF_ENCODED
+flag to
+.BR preadv2 (2)
+and
+.BR pwritev2 (2).
+If
+.B RWF_ENCODED
+is specified, then
+.I iov[0].iov_base
+points to an
+.I encoded_iov
+structure, defined in
+.I <linux/fs.h>
+as:
+.PP
+.in +4n
+.EX
+struct encoded_iov {
+    __aligned_u64 len;
+    __aligned_u64 unencoded_len;
+    __aligned_u64 unencoded_offset;
+    __u32 compression;
+    __u32 encryption;
+};
+.EE
+.in
+.PP
+This may be extended in the future, so
+.I iov[0].iov_len
+must be set to
+.I sizeof(struct encoded_iov)
+for forward/backward compatibility.
+The remaining buffers contain the encoded data.
+.PP
+.I compression
+and
+.I encryption
+are the encoding fields.
+.I compression
+is
+.B ENCODED_IOV_COMPRESSION_NONE
+(zero)
+or a filesystem-specific
+.B ENCODED_IOV_COMPRESSION_*
+constant;
+see
+.B "Filesystem support"
+below.
+.I encryption
+is currently always
+.B ENCODED_IOV_ENCRYPTION_NONE
+(zero).
+.PP
+.I unencoded_len
+is the length of the unencoded (i.e., decrypted and decompressed) data.
+.I unencoded_offset
+is the offset from the first byte of the unencoded data
+to the first byte of logical data in the file
+(less than or equal to
+.IR unencoded_len ).
+.I len
+is the length of the data in the file
+(less than or equal to
+.I unencoded_len
+-
+.IR unencoded_offset ).
+See
+.B Extent layout
+below for some examples.
+.PP
+If the unencoded data is actually longer than
+.IR unencoded_len ,
+then it is truncated;
+if it is shorter, then it is extended with zeroes.
+.PP
+.BR pwritev2 (2)
+uses the metadata specified in
+.IR iov[0] ,
+writes the encoded data from the remaining buffers,
+and returns the number of encoded bytes written
+(that is, the sum of
+.I iov[n].iov_len
+for 1 <=
+.I n
+<
+.IR iovcnt ;
+partial writes will not occur).
+At least one encoding field must be non-zero.
+Note that the encoded data is not validated when it is written;
+if it is not valid (e.g., it cannot be decompressed),
+then a subsequent read may return an error.
+If the
+.I offset
+argument to
+.BR pwritev2 (2)
+is -1, then the file offset is incremented by
+.IR len .
+If
+.I iov[0].iov_len
+is less than
+.I sizeof(struct encoded_iov)
+in the kernel,
+then any fields unknown to user space are treated as if they were zero;
+if it is greater and any fields unknown to the kernel are non-zero,
+then this returns -1 and sets
+.I errno
+to
+.BR E2BIG .
+.PP
+.BR preadv2 (2)
+populates the metadata in
+.IR iov[0] ,
+the encoded data in the remaining buffers,
+and returns the number of encoded bytes read.
+This will only return one extent per call.
+This can also read data which is not encoded;
+all encoding fields will be zero in that case.
+If the
+.I offset
+argument to
+.BR preadv2 (2)
+is -1, then the file offset is incremented by
+.IR len .
+If
+.I iov[0].iov_len
+is less than
+.I sizeof(struct encoded_iov)
+in the kernel and any fields unknown to user space are non-zero,
+then
+.BR preadv2 (2)
+returns -1 and sets
+.I errno
+to
+.BR E2BIG ;
+if it is greater,
+then any fields unknown to the kernel are returned as zero.
+If the provided buffers are not large enough
+to return an entire encoded extent,
+then
+.BR preadv2 (2)
+returns -1 and sets
+.I errno
+to
+.BR ENOBUFS .
+.PP
+As the filesystem page cache typically contains decoded data,
+encoded I/O bypasses the page cache.
+.SS Extent layout
+By using
+.IR len ,
+.IR unencoded_len ,
+and
+.IR unencoded_offset ,
+it is possible to refer to a subset of an unencoded extent.
+.PP
+In the simplest case,
+.I len
+is equal to
+.I unencoded_len
+and
+.I unencoded_offset
+is zero.
+This means that the entire unencoded extent is used.
+.PP
+However, suppose we read 50 bytes into a file
+which contains a single compressed extent.
+The filesystem must still return the entire compressed extent
+for us to be able to decompress it,
+so
+.I unencoded_len
+would be the length of the entire decompressed extent.
+However, because the read was at offset 50,
+the first 50 bytes should be ignored.
+Therefore,
+.I unencoded_offset
+would be 50,
+and
+.I len
+would accordingly be
+.I unencoded_len
+- 50.
+.PP
+Additionally, suppose we want to create an encrypted file with length 500,
+but the file is encrypted with a block cipher using a block size of 4096.
+The unencoded data would therefore include the appropriate padding,
+and
+.I unencoded_len
+would be 4096.
+However, to represent the logical size of the file,
+.I len
+would be 500
+(and
+.I unencoded_offset
+would be 0).
+.PP
+Similar situations can arise in other cases:
+.IP * 3
+If the filesystem pads data to the filesystem block size before compressing,
+then compressed files with a size unaligned to the filesystem block size
+will end with an extent with
+.I len
+<
+.IR unencoded_len .
+.IP *
+Extents cloned from the middle of a larger encoded extent with
+.B FICLONERANGE
+may have a non-zero
+.I unencoded_offset
+and/or
+.I len
+<
+.IR unencoded_len .
+.IP *
+If the middle of an encoded extent is overwritten,
+the filesystem may create extents with a non-zero
+.I unencoded_offset
+and/or
+.I len
+<
+.I unencoded_len
+for the parts that were not overwritten.
+.SS Security
+Encoded I/O creates the potential for some security issues:
+.IP * 3
+Encoded writes allow writing arbitrary data
+which the kernel will decode on a subsequent read.
+Decompression algorithms are complex
+and may have bugs which can be exploited by maliciously crafted data.
+.IP *
+Encoded reads may return data which is not logically present in the file
+(see the discussion of
+.I len
+vs
+.I unencoded_len
+above).
+It may not be intended for this data to be readable.
+.PP
+Therefore, encoded I/O requires privilege.
+Namely, the
+.B RWF_ENCODED
+flag may only be used if the file description has the
+.B O_ALLOW_ENCODED
+file status flag set,
+and the
+.B O_ALLOW_ENCODED
+flag may only be set by a thread with the
+.B CAP_SYS_ADMIN
+capability.
+The
+.B O_ALLOW_ENCODED
+flag can be set by
+.BR open (2)
+or
+.BR fcntl (2).
+It can also be cleared by
+.BR fcntl (2);
+clearing it does not require
+.B CAP_SYS_ADMIN.
+Note that it is not cleared on
+.BR fork (2)
+or
+.BR execve (2).
+One may wish to use
+.B O_CLOEXEC
+with
+.BR O_ALLOW_ENCODED .
+.SS Filesystem support
+Encoded I/O is supported on the following filesystems:
+.TP
+Btrfs (since Linux 5.12)
+.IP
+Btrfs supports encoded reads and writes of compressed data.
+The data is encoded as follows:
+.RS
+.IP * 3
+If
+.I compression
+is
+.BR ENCODED_IOV_COMPRESSION_BTRFS_ZLIB ,
+then the encoded data is a single zlib stream.
+.IP *
+If
+.I compression
+is
+.BR ENCODED_IOV_COMPRESSION_BTRFS_ZSTD ,
+then the encoded data is a single zstd frame compressed with the
+.I windowLog
+compression parameter set to no more than 17.
+.IP *
+If
+.I compression
+is one of
+.BR ENCODED_IOV_COMPRESSION_BTRFS_LZO_4K ,
+.BR ENCODED_IOV_COMPRESSION_BTRFS_LZO_8K ,
+.BR ENCODED_IOV_COMPRESSION_BTRFS_LZO_16K ,
+.BR ENCODED_IOV_COMPRESSION_BTRFS_LZO_32K ,
+or
+.BR ENCODED_IOV_COMPRESSION_BTRFS_LZO_64K ,
+then the encoded data is compressed page by page
+(using the page size indicated by the name of the constant)
+with LZO1X
+and wrapped in the format documented in the Linux kernel source file
+.IR fs/btrfs/lzo.c .
+.RE
+.IP
+Additionally, there are some restrictions on
+.BR pwritev2 (2):
+.RS
+.IP * 3
+.I offset
+(or the current file offset if
+.I offset
+is -1) must be aligned to the sector size of the filesystem.
+.IP *
+.I len
+must be aligned to the sector size of the filesystem
+unless the data ends at or beyond the current end of the file.
+.IP *
+.I unencoded_len
+and the length of the encoded data must each be no more than 128 KiB.
+This limit may increase in the future.
+.IP *
+The length of the encoded data must be less than or equal to
+.IR unencoded_len .
+.IP *
+If using LZO, the filesystem's page size must match the compression page size.
+.RE
+.SH SEE ALSO
+.BR open (2),
+.BR preadv2 (2)
